@@ -187,7 +187,21 @@
 
     // ===== Tasks 初期化 =====
     async function initLandmarker(){
-      const { FaceLandmarker, FilesetResolver, VisionRunningMode } = window;
+      try{
+        const { FaceLandmarker, FilesetResolver, VisionRunningMode } = window;
+        const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
+        landmarker = await FaceLandmarker.createFromOptions(fileset, {
+          baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+          runningMode: VisionRunningMode.VIDEO,
+          numFaces: 1,
+          outputFaceBlendshapes: false,
+          outputFacialTransformationMatrixes: true,
+        });
+      }catch(err){
+        console.error(err);
+        setWarning(true, 'Face Landmarker の初期化に失敗しました。Canvas はビデオのみ描画します');
+      }
+    } = window;
       const fileset = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm");
       landmarker = await FaceLandmarker.createFromOptions(fileset, {
         baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
@@ -213,18 +227,63 @@
 
     // ===== ループ =====
     function loop(){
-      if (!landmarker) return;
       const now = performance.now();
-      const res = landmarker.detectForVideo(video, now);
 
-      ctx.clearRect(0,0,canvas.width,canvas.height);
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      // 常に下のキャンバスへミラー描画（検出に失敗しても真っ黒にならないように）
+      try{
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      }catch(e){ /* drawImage 失敗時は何もしない */ }
 
-      if (!res || !res.faceLandmarks || res.faceLandmarks.length === 0){
-        setWarning(false, '顔が検出できません');
-        output.textContent = '顔が見つかりません';
-        requestAnimationFrame(loop); return;
+      // landmarker があれば検出を実行
+      if (landmarker){
+        const res = landmarker.detectForVideo(video, now);
+        if (res && res.faceLandmarks && res.faceLandmarks.length){
+          const lm = res.faceLandmarks[0];
+          const nose = lm[1];
+          const chin = lm[152];
+          drawPoint(nose, '#22c55e');
+          drawPoint(chin, '#2563eb');
+
+          const yDiff = (chin.y - nose.y);
+          const noseZ = nose.z;
+          sYdiff = (sYdiff==null)? yDiff : PARAMS.alphaYdiff*yDiff + (1-PARAMS.alphaYdiff)*sYdiff;
+          sNoseZ = (sNoseZ==null)? noseZ : PARAMS.alphaNoseZ*noseZ + (1-PARAMS.alphaNoseZ)*sNoseZ;
+
+          const dir = classifyDirection(sYdiff); faceState.dir = dir;
+          const prox = classifyProximity(sNoseZ); faceState.prox = prox;
+
+          // 顔の姿勢
+          let headPitch=0, headYaw=0, headRoll=0;
+          if (res.facialTransformationMatrixes && res.facialTransformationMatrixes.length){
+            const M = res.facialTransformationMatrixes[0].data;
+            const e = matrixToEulerDeg(M); headPitch=e.pitch; headYaw=e.yaw; headRoll=e.roll;
+          }
+          const { bent, neckAngle } = isBent(faceState.dir, faceState.prox, sPitch, headPitch);
+          updateSustain(bent);
+
+          output.textContent =
+            `Device Pitch: ${sPitch.toFixed(1)}°
+`+
+            `Head  Pitch: ${headPitch.toFixed(1)}°  (Yaw:${headYaw.toFixed(1)}°, Roll:${headRoll.toFixed(1)}°)
+`+
+            `Neck  Angle: ${neckAngle.toFixed(1)}°
+`+
+            `yDiff(平滑): ${sYdiff?.toFixed(4)} / noseZ(平滑): ${sNoseZ?.toFixed(4)}
+`+
+            `顔向き: ${faceState.dir} / 顔距離: ${faceState.prox}`;
+        } else {
+          // 顔検出がない場合も次フレーム継続
+          setWarning(false, '顔が検出できません');
+          output.textContent = '顔が見つかりません';
+        }
+      } else {
+        // Landmarker未初期化でも、映像コピーは回し続ける
+        output.textContent = '初期化中…（映像はコピー済み）';
       }
+
+      requestAnimationFrame(loop);
+    }
 
       const lm = res.faceLandmarks[0];
       const nose = lm[1];
@@ -264,12 +323,40 @@
 
     // ===== スタート =====
     async function startAll(){
-      // iOS: センサー許可
+      // iOS: センサー許可（未許可でもカメラは起動する）
       if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function'){
         try{
           const res = await DeviceOrientationEvent.requestPermission();
-          if (res === 'granted') window.addEventListener('deviceorientation', handleOrientation);
-          else { output.textContent = 'センサーの利用が許可されませんでした。'; return; }
+          if (res === 'granted') {
+            window.addEventListener('deviceorientation', handleOrientation);
+          } else {
+            output.textContent = '端末の傾きセンサーは未許可ですが、カメラは起動します。';
+          }
+        } catch {
+          output.textContent = 'センサー許可でエラーが発生しました（カメラは起動します）';
+        }
+      } else {
+        window.addEventListener('deviceorientation', handleOrientation);
+      }
+
+      await initCamera();
+      await initLandmarker();
+
+      // 動画が再生開始してからループを開始（ブラックキャンバス対策）
+      if (video.readyState >= 2) {
+        requestAnimationFrame(loop);
+      } else {
+        video.addEventListener('playing', () => requestAnimationFrame(loop), { once:true });
+      }
+
+      startBtn.disabled = true; calibBtn.disabled = false; resetBtn.disabled = false;
+      setWarning(false, '測定中...');
+
+      const saved = loadCalibration();
+      if (saved) { PARAMS.calibYdiff = saved.y; PARAMS.calibNoseZ = saved.z; }
+
+      requestAnimationFrame(loop);
+    }
         }catch{ output.textContent = 'センサー許可でエラーが発生しました。'; return; }
       }else{
         window.addEventListener('deviceorientation', handleOrientation);
